@@ -174,44 +174,52 @@ public class DNSLookupService {
      */
     public Set<ResourceRecord> individualQueryProcess(DNSQuestion question, InetAddress server)
             throws DNSErrorException {
+        DNSMessage query = buildQuery(question);
+        int txId = query.getID();
+        byte[] out = query.getUsed();
+        DatagramPacket request = new DatagramPacket(out, out.length, server, DEFAULT_DNS_PORT);
 
-        for (int attempts = 0; attempts < MAX_QUERY_ATTEMPTS; attempts++) {
+        for (int attempt = 0; attempt < MAX_QUERY_ATTEMPTS; attempt++) {
+            verbose.printQueryToSend("UDP", question, server, txId);
+
             try {
-                DNSMessage query = buildQuery(question);
-                int txId = query.getID();
-
-                byte[] out = query.getUsed();
-                verbose.printQueryToSend("UDP", question, server, txId);
-                DatagramPacket request = new DatagramPacket(out, out.length, server, DEFAULT_DNS_PORT);
                 socket.send(request);
 
-                byte[] inBuf = new byte[MAX_DNS_MESSAGE_LENGTH];
-                DatagramPacket reply = new DatagramPacket(inBuf, inBuf.length);
-                socket.receive(reply);
+                while (true) {
+                    byte[] inBuf = new byte[MAX_DNS_MESSAGE_LENGTH];
+                    DatagramPacket reply = new DatagramPacket(inBuf, inBuf.length);
 
-                DNSMessage response = new DNSMessage(reply.getData(), reply.getLength());
-                if (response.getID() != txId) {
-                    continue;
+                    socket.receive(reply);
+
+                    byte[] data = reply.getData();
+                    int len = reply.getLength();
+                    DNSMessage candidate = new DNSMessage(data, len);
+                    if (!candidate.getQR()) continue;
+                    if (candidate.getID() != txId) continue;
+
+                    if (candidate.getQDCount() != 1) continue;
+                    DNSQuestion receivedQ = candidate.getQuestion();
+                    if (!question.equals(receivedQ)) continue;
+
+                    DNSMessage response = new DNSMessage(data, len);
+
+                    try {
+                        return processResponse(response);
+                    } catch (DNSReplyTruncatedException e) {
+                        return tcpFallback(query, question, server);
+                    }
                 }
 
-                try {
-                    return processResponse(response);
-                } catch (DNSReplyTruncatedException t) {
-                    return tcpFallback(query, question, server);
-                }
             } catch (SocketTimeoutException e) {
 
-            } catch (DNSErrorException e) {
-                throw e;
-            } catch (Exception e) {
+            } catch (IOException e) {
 
             }
         }
         return null;
     }
 
-    private Set<ResourceRecord> tcpFallback(DNSMessage originalQuery,
-                                            DNSQuestion question, InetAddress server)
+    private Set<ResourceRecord> tcpFallback(DNSMessage originalQuery, DNSQuestion question, InetAddress server)
             throws DNSErrorException {
 
         byte[] msg = originalQuery.getUsed();
@@ -222,31 +230,25 @@ public class DNSLookupService {
         try (Socket s = new Socket(server, DEFAULT_DNS_PORT)) {
             s.setSoTimeout(SO_TIMEOUT);
 
-            OutputStream os = s.getOutputStream();
-            os.write((msg.length >> 8) & 0xFF);
-            os.write(msg.length & 0xFF);
-            os.write(msg);
-            os.flush();
+            DataOutputStream dos = new DataOutputStream(s.getOutputStream());
+            DataInputStream dis = new DataInputStream(s.getInputStream());
 
-            InputStream is = s.getInputStream();
-            int b1 = is.read(), b2 = is.read();
-            if (b1 < 0 || b2 < 0) throw new SocketException("TCP DNS: failed to read length");
-            int respLen = ((b1 & 0xFF) << 8) | (b2 & 0xFF);
+            dos.writeShort(msg.length);
+            dos.write(msg);
+            dos.flush();
 
+            int respLen = dis.readUnsignedShort();
             byte[] resp = new byte[respLen];
-            int read = 0;
-            while (read < respLen) {
-                int r = is.read(resp, read, respLen - read);
-                if (r < 0) throw new SocketException("TCP DNS: stream ended early");
-                read += r;
-            }
+            dis.readFully(resp);
 
             DNSMessage response = new DNSMessage(resp, respLen);
-            return processResponse(response);
 
-        } catch (DNSErrorException e) {
-            throw e;
-        } catch (Exception e) {
+            try {
+                return processResponse(response);
+            } catch (DNSReplyTruncatedException e) {
+                return null;
+            }
+        } catch (IOException e) {
             return null;
         }
     }
@@ -299,21 +301,26 @@ public class DNSLookupService {
      * @throws DNSReplyTruncatedException if the TC bit is 1 in the reply header
      */
     public Set<ResourceRecord> processResponse(DNSMessage message) throws DNSErrorException, DNSReplyTruncatedException {
-        if (message.getRcode() != 0) {
-            throw new DNSErrorException("DNS Error: RCODE = " + message.getRcode());
-        }
-        if (message.getTC()) {
-            throw new DNSErrorException("DNS Error: Reply Truncated");
-        }
+        int txId = message.getID();
+        boolean authoritative = message.getAA();
+        boolean tc = message.getTC();
+        int rcode = message.getRcode();
 
+        verbose.printResponseHeaderInfo(txId, authoritative, tc, rcode);
+
+        if (rcode != 0) {
+            throw new DNSErrorException("DNS Error: RCODE = " + rcode);
+        }
+        if (tc) {
+            throw new DNSReplyTruncatedException("DNS reply truncated (TC=1)");
+        }
         Set<ResourceRecord> records = new HashSet<>();
-
         for (int i = 0; i < message.getQDCount(); i++) {
             message.getQuestion();
         }
-
-        verbose.printAnswersHeader(message.getANCount());
-        for (int i = 0; i < message.getANCount(); i++) {
+        int an = message.getANCount();
+        verbose.printAnswersHeader(an);
+        for (int i = 0; i < an; i++) {
             ResourceRecord rr = message.getRR();
             if (rr != null) {
                 cache.addResult(rr);
@@ -321,9 +328,9 @@ public class DNSLookupService {
                 verbose.printIndividualResourceRecord(rr, rr.getRecordType().getCode(), rr.getRecordClass().getCode());
             }
         }
-
-        verbose.printNameserversHeader(message.getNSCount());
-        for (int i = 0; i < message.getNSCount(); i++) {
+        int ns = message.getNSCount();
+        verbose.printNameserversHeader(ns);
+        for (int i = 0; i < ns; i++) {
             ResourceRecord rr = message.getRR();
             if (rr != null) {
                 cache.addResult(rr);
@@ -331,9 +338,9 @@ public class DNSLookupService {
                 verbose.printIndividualResourceRecord(rr, rr.getRecordType().getCode(), rr.getRecordClass().getCode());
             }
         }
-
-        verbose.printAdditionalInfoHeader(message.getARCount());
-        for (int i = 0; i < message.getARCount(); i++) {
+        int ar = message.getARCount();
+        verbose.printAdditionalInfoHeader(ar);
+        for (int i = 0; i < ar; i++) {
             ResourceRecord rr = message.getRR();
             if (rr != null) {
                 cache.addResult(rr);
